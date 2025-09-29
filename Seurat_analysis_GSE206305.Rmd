@@ -1,0 +1,1300 @@
+---
+title: "Manuscrito TFM de GSE206305"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+  html_notebook:
+    toc: true
+    theme: flatly
+bibliography: references.bib
+---
+
+# Introducción
+
+En este R Notebook se realiza el análisis de los datos de scRNAseq correspondientes al [al identificador GEO](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE206305). Las operaciones previas a la obtención de la matriz de recuentos analizada en esta Notebook se detallan en el manuscrito.
+
+# 0. Pasos previos
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "/Users/Pedrinho/Documents/TFM_codigo/TFM_scRNAseq")
+```
+
+## 0.1 Carga de las matrices de recuentos
+
+Como se detalla en el manuscrito, el análisis partirá de las matrices de recuentos generadas por Cell Bender. Tras ejecutar Cell Bender con el comando:
+
+``` bash
+cellbender remove-background --cuda --input <input.h5> --output <output.h5> --fpr 0.01 0.05 0.1
+```
+
+se generan distintos archivos .h5 para cada valor de FPR (False Positive Rate):
+
+-   `raw_feature_bc_matrix_cellbender_filtered_FPR_0.01.h5`
+-   `raw_feature_bc_matrix_cellbender_filtered_FPR_0.01_filtered.h5`
+-   (y equivalentes para FPR 0.05 y 0.1)
+
+La diferencia es que **`raw_feature_bc_matrix_cellbender_filtered_FPR_0.01_filtered.h5`** contiene ya un filtrado previo automático realizado por Cell Bender. Utilizaremos estos archivos para el análisis.
+
+::: {.alert .alert-info}
+<strong>Info:</strong> las matrices dispersas (*sparce*) constituyen una estrategia para el almacenamiento eficiente de datos que contienen muchos ceros, como ocurre en las matrices de recuentos de scRNA-seq. En esencia, mientras que las matrices completas (o densas) almacenan todos los elementos, las dispersas conservan únicamente los elementos distintos de cero y sus índices de filas [@matrices]
+:::
+
+Procedemos a la creación de la matriz dispersa de recuentos a partir de los archivos generados por Cell Bender. Para ello, utilizamos la función `Read_CellBender_h5_Multi_Directory_fixed`, que es una versión corregida y adaptada de la función original `Read_CellBender_h5_Multi_Directory` del paquete `ScCustomize`. Esta adaptación fue necesaria para solucionar un error en la construcción de las rutas de los archivos, eliminando la dependencia de nombres redundantes en los archivos de muestra.
+
+Una vez obtenida la matriz de recuentos, verificamos los recuentos de las 30 primeras células para tres genes de ejemplo, asegurando así la correcta lectura y estructuración de los datos.
+
+```{r}
+# Carga de la versión corregida de la función y paquetes necesarios
+
+library(cli)
+library(pbapply)
+library(parallel)
+library(stringr)
+#library(scCustomize)
+
+source("scripts/Read_CellBender_h5_Multi_Directory_fixed.R")
+
+# Uso de la versión corregida de Read_CellBender_h5_Multi_Directory
+
+base_path= "raw_data/CellBender_output"
+
+custom_name= "raw_feature_bc_matrix_cellbender_filtered_FPR_0.01_filtered.h5"
+
+matriz_dispersa <- scCustomize::Read_CellBender_h5_Multi_Directory_fixed(
+  base_path = base_path,
+  custom_name = custom_name,
+  merge = TRUE
+)
+
+# Comprobamos los recuentos de las 30 primeras células para 3 genes de ejemplo
+
+matriz_dispersa[c("Sox17", "Rp1", "Xkr4"), 1:30]
+```
+
+Los puntos se corresponden con 0. Los nombres de las columnas (que se corresponden con las células) no se muestran.
+
+## 0.2 Creación del objeto Seurat
+
+A partir de los recuentos de la matriz dispersa podemos crear el objeto Seurat con la función `CreateSeuratObject`.
+
+```{r}
+seu<- Seurat::CreateSeuratObject(counts = matriz_dispersa, 
+                        project = "TFM_GSE206305", 
+                        min.cells = 3, 
+                        min.features = 100)
+```
+
+::: {.alert .alert-info}
+<strong>Nota:</strong> durante la creación del objeto Seurat ya se puede incluir un primer filtrado de la matriz. En este caso, solo se cargarán en el objeto genes que se exprean en al menos 3 células y células que tengan expresión como mínimo de 100 genes diferentes.
+:::
+
+### Visión preliminar del objeto Seurat
+
+En este punto es interesante hacer una primera revisión del objeto Seurat.
+
+```{r}
+seu
+```
+
+Observamos 14333 genes (*features*) a lo largo de 652 células (*samples*).
+
+::: {.alert .alert-info}
+<strong>Nota:</strong> esto se compara con los 15257 genes a lo largo de 1253 células obtenidos en la exploración inicial a partir del objeto GSE206305_RAW.tar.
+:::
+
+# 1. Control de calidad
+
+Durante la creación del objeto Seurat ya se calculan unas primeras métricas de calidad para cada célula, principalmente el número total de recuentos UMI[^1] por célula (`nCount_RNA`) y el número de genes detectados por célula (`nFeature_RNA`).
+
+[^1]: *Unique molecular identifiers* (UMI): pequeñas secuencias de ARN que permiten identificar los transcritos.
+
+Podemos visualizar estas métricas de calidad con un gráfico de violín:
+
+```{r}
+Seurat::VlnPlot(seu, features = c("nCount_RNA",
+                                  "nFeature_RNA"))
+```
+
+Podemos observar como para ambas métricas existe un rango de variabilidad considerable. Este primer análisis es importante, ya que debemos tener en cuenta que una célula con un número muy bajo de recuentos o genes detectados probablemente no será muy informativa, pero por otro lado un número excesivo en estos valores podría corresponderse con dobletes[^2].
+
+[^2]: En el contexto de scRNASeq hablamos de dobletes cuando varias células se secuencian como una sola.
+
+Para profundizar en la calidad de los datos, vamos a calcular los porcentajes de recuentos procedentes de 3 tipos de transcritos:
+
+-   **Genes mitocondriales**: cuando la membrana celular se daña, la pérdida de ARN citoplasmático se produce de forma más rápida que la de ARN mitocondrial por la propia arquitectura celular. En consecuencia, una célula con un porcentaje de genes mitocondriales elevado podría corresponderse con una célula dañada [@luna].
+
+-   **Genes ribosomales**: se refiere a ARNm que codifica para proteínas ribosomales, **NO a ARNr**. Si bien es cierto que no apuntan claramente a problemas concretos con la calidad de los datos, el estudio de su abundancia relativa puede tener relevancia biológica. Por ejemplo, en @caron2020 se demostró que el desarrollo de algunas células de cáncer está inversamente correlacionado con los niveles de expresión de proteínas ribosómicas.
+
+-   **Genes de hemoglobina**: por su propia naturaleza, estos transcritos son muy abundantes en eritrocitos. En función del diseño experimental, es posible que se produzca una contaminación por eritrocitos, por lo que con esta magnitud podemos corregirla.
+
+Estos cálculos se pueden realizar con la función `PercentageFeatureSet` de Seurat. Para cada categoría se seleccionan los genes con patrones basados en expresiones regulares
+
+```{r}
+# mitochondrial genes
+seu <- Seurat::PercentageFeatureSet(seu, 
+                                    pattern = "^[Mm][Tt]-", 
+                                    col.name = "percent.mito")
+
+# ribosomal genes
+seu <- Seurat::PercentageFeatureSet(seu, 
+                                    pattern = "^[Rr][Pp][SsLl]",
+                                    col.name = "percent.ribo")
+
+# hemoglobin genes (but not HBP)
+seu <- Seurat::PercentageFeatureSet(seu,
+                                    pattern = "^[hb][Hb][^(P)]",
+                                    col.name = "percent.globin")
+```
+
+::: {.alert .alert-info}
+<strong>Nota:</strong> observamos como estos datos calculados se añaden al objeto de Seurat original, concretamente al *data frame* con los metadatos, en lugar de guardarse como objetos independientes.
+:::
+
+Para la visualización podemos recurrir nuevamente a gráficos de violín.
+
+```{r}
+Seurat::VlnPlot(seu, features = c("percent.mito",
+                                  "percent.ribo",
+                                  "percent.globin"))
+```
+
+No se observan grandes diferencias entre muestras. En todos los casos se observa una distribución unimodal, con algunos *outliers*. No se detectan genes de hemoglobina, algo que es consistente con el protocolo de aislamiento para células de Schwann descrito por los autores originales.
+
+Otros cálculos habituales para la evaluación de la calidad pasan por medir la expresión relativa de algunos genes del conjunto de datos, particularmente aquellos con mayores niveles de expresión. En diagrama de cajas y bigotes podemos representar por ejemplo los 20 genes con mayor porcentaje de recuentos relativos por célula a lo largo de todas las muestras.
+
+```{r}
+library(ggplot2)
+library(Matrix)
+library(Seurat)
+
+most_expressed_boxplot <- function(object, ngenes = 20){
+  
+  # matrix of raw counts
+  cts <- Seurat::GetAssayData(object, assay = "RNA", layer = "counts")
+  
+  # get percentage/cell
+  cts <- t(cts)/colSums(cts)*100
+  medians <- SparseArray::colMedians(cts)
+  
+  # get top n genes
+  most_expressed <- order(medians, decreasing = T)[ngenes:1]
+  most_exp_matrix <- as.matrix((cts[,most_expressed]))
+  
+  # prepare for plotting
+  most_exp_df <- stack(as.data.frame(most_exp_matrix))
+  colnames(most_exp_df) <- c("perc_total", "gene")
+  
+  # boxplot with ggplot2
+  boxplot <- ggplot(most_exp_df, aes(x=gene, y=perc_total)) +
+    geom_boxplot() +
+    coord_flip()
+  return(boxplot)
+}
+
+most_expressed_boxplot(seu, 20)
+```
+
+Se observa una elevada expresión de Gm42418, un lncRNA de función aparentemente desconocida, pero que según algunos autores puede ser un signo de contaminación por ARNr [@akama-garren2021].
+
+**IMPORTANTE**: buscar si hay expresión elevada de los lncRNA en algún cluster específico (Malat1, Neat1, Gm42418). Si está dispersa la expresión, es posible corregirlo.
+
+Además, como ocurre con muchos experimentos de scRNAseq elaborados con enriquecimiento de cola de poli A de 10X, se observa una elevada expresión relativa de MALAT1, un lncRNA[^3]. Aunque muchos investigadores deciden eliminarlo, se ha demostrado que puede tener relevancia biológica @shaath2021. Además, tal y como se indica en varios artículos referenciados en la propia web de 10X, los niveles de MALAT también pueden utilizarse como medida de calidad, ya que se ha observado una correlación inversa con la integridad celular [@clarke], pero también que niveles bajos pueden corresponderse con gotas vacías o restos citosólicos [@montserrat-ayuso2024].
+
+[^3]: lncRNA, *long non coding RNA*, ARN no codificante largo.
+
+## 1.1 Filtrado de células
+
+Una vez revisadas las métricas de calidad podemos tomar decisiones sobre el filtrado de células. En este caso, hemos determinado lo siguiente:
+
+-   Existen células con un muy elevado nivel de genes mitocondriales que deben ser filtradas.
+
+-   Tras el primer filtrado durante la creación del objeto Seurat ya se eliminaron las células con muy bajo nivel de *features* (\< 100), por entenderse que se corresponden estas con células poco informativas. El resultado es una distribución bastante homogénea a lo largo de las 3 muestras, en las que la mayoría de las células restantes se concentran alrededor del mismo nivel de *features*. No obstante, algunas células muestran niveles muy superiores, lo que podría indicar presencia de dobletes. Más allá de un filtrado por umbral de *features* máximo estricto, optaremos por una evaluación de la correlación entre los niveles de *counts* y *features* más adelante.
+
+-   MALAT1, un lncRNA que es famoso en el ámbito del scRNAseq por apuntar en ocasiones a daño celular, está presente en cantidades relativamente grandes en nuestros datos. Sin embargo, como el resto de métricas de calidad no nos indican problemas en este sentido, procederemos con el análisis.
+
+Vamos a recurrir a una estrategia de filtrado por etapas, comenzando por uno de los principales indicadores de calidad: el % de transcritos mitocondriales. Escogemos el umbral del 15% por ser el utilizado en el Scyatic Nerve Atlas, una colección de conjuntos de datos de tejido nervioso muy utilizada en el ámbito de estudios de neurociencia. El filtrado se realiza con la función `subset` de Seurat.
+
+::: {.alert .alert-warning}
+<strong>Nota:</strong> En el artículo del que proceden los datos, los autores optaron por un filtrado mitocondrial más estricto (\< 5%), y además del *features* \< 100 incluyeron un corte de *features* \< 3000 para descartar dobletes.
+:::
+
+```{r}
+seu <- subset(seu, subset = 
+                percent.mito < 15)
+```
+
+Podemos observar el impacto del filtrado con nuevos gráficos de violín.
+
+```{r}
+Seurat::VlnPlot(seu, features = c("percent.mito", "nFeature_RNA", "nCount_RNA"))
+```
+
+Tras el filtrado mitocondrial, podemos atender a las magnitudes de *counts* (número total de moléculas detectadas en una célula) y de *features* (número de genes detectados en cada célula). Analizar esta correlación es interesante, ya que un elevado *nFeature_RNA* respecto a *nCount* indica que lo que a *priori* identificamos como una célula puede ser en realidad un doblete (o multiplete). Además, un *nFeature_RNA* bajo para una célula indica que puede estar muerta/muerta o ser una gota vacía.
+
+En combinación con el filtrado mitocondrial, la eliminación de valores atípicos de estos grupos ayuda a retirar del análisis una variedad de artefactos (dobletes/células muertas/gotas vacías).
+
+```{r}
+scatter_plot <- FeatureScatter(seu,
+               feature1 = "nCount_RNA",
+               feature2 = "nFeature_RNA",
+               pt.size = 0.5,
+               shuffle = TRUE)  +
+  scale_color_viridis_d(option = "mako")
+
+scatter_plot
+```
+
+La correlación inicial observada es ya muy buena, por lo que no parece necesario introducir filtrado. Esto significa que en principio no vemos *outliers* que puedan introducir sesgos técnicos *downstream*.
+
+# 2. Normalización y escalado
+
+Tras la retirada de células de baja calidad del conjunto de datos, el siguiente paso es la normalización de los datos. Seurat aplica por defecto un método de normalización-escalado global logarítmico (`LogNormalize`), que normaliza las medidas de expresión de las *features* de cada célula por los niveles totales de expresión, la multiplica por un factor de escalado (por defecto 10000) y realiza la transformación logarítmica del resultado.
+
+::: {.alert .alert-info}
+<strong>Info:</strong> El escalado es esencial para eliminar la variabilidad técnica no deseada, como las diferencias en el tamaño celular, la eficiencia de captura del ARN y la profundidad de secuenciación, de modo que las diferencias observadas en la expresión génica reflejen con mayor precisión las verdaderas diferencias biológicas.
+:::
+
+Utilizaremos la función `NormalizeData`, que guardará los datos normalizados en el slot "RNA" (un ítem del *slot* `@assay`):
+
+```{r}
+seu <- Seurat::NormalizeData(seu,
+                     normalization.method = "LogNormalize",
+                     scale.factor = 10000)
+```
+
+::: {.alert .alert-info}
+<strong>Info:</strong> Al contrario de lo que ocurre normalmente en R cuando tomamos como input y output el mismo objeto, el objeto Seurat **NO** se sobreescribe, sino que se añade la nueva información en otras capas.
+:::
+
+## 2.1 *Features* variables
+
+A continuación, identificamos un subconjunto de *features* que exhiben el mayor grado de variabilidad célula a célula, es decir, aquellas que muestran grandes niveles de expresión en algunas células y muy bajos en otras. Centrarse en estos genes más adelante nos ayudará a extraer relevancia biológica del análisis.
+
+Utilizaremos la función `FindVariableFeatures` de Seurat, que por defecto devuelve 2000 genes.
+
+```{r}
+seu <- Seurat::FindVariableFeatures(seu,
+                            selection.method = "vst",
+                            nfeatures = 2000)
+```
+
+A modo de ejemplo, veamos los 10 genes más variables entre células y representémolos en un gráfico de dispersión junto al resto de los genes:
+
+```{r}
+# Identify the 10 most highly variable genes
+top10 <- head(Seurat::VariableFeatures(seu), 10)
+top10
+
+vf_plot <- Seurat::VariableFeaturePlot(seu)
+Seurat::LabelPoints(plot = vf_plot,
+            points = top10, repel = TRUE)
+```
+
+Algunos de estos genes más variablemente expresados están relacionados con procesos de inflamación (Retnla, Cxcl1, IL-1β...), reorganización de la matriz extracelular (Dcn, Smoc2, Gsn)...
+
+**AÑADIR CITAS**
+
+## 2.2 Escalado
+
+A continuación, aplicaremos el escalado propiamente dicho, un paso de transformación lineal que se suele realizar antes de las técnicas de reducción dimensional como el PCA.
+
+Con la función `ScaleData` de Seurat conseguimos:
+
+1.  Desplazar la expresión de cada gen, de modo que la expresión media entre células sea 0.
+2.  Escalar la expresión de cada gen, de modo que la varianza entre células sea 1.
+
+Con este paso conseguimos equilibrar el peso para los análisis posteriores, de manera que los genes más altamente expresados no dominen por completo. Los resultados se almacenan en `seu$RNA@scale.data`.
+
+```{r}
+seu <- Seurat::ScaleData(seu)
+```
+
+::: {.alert .alert-info}
+<strong>Info:</strong> Seurat incluye una función (`SCTransform`) que integra en los pasos de normalización, identificación de genes altamente variables y escalado en un solo paso. Si bien está recomendada, también resulta más lenta y menos transparente en el contexto de un tutorial que utilizar las funciones `NormalizeData`, `VariableFeatures` y `ScaleData` por separado.
+:::
+
+# 3. Reducción de la dimensionalidad
+
+Una vez tenemos los datos normalizados y escalados y hemos identificado los genes con mayor variabilidad, podemos proceder a reducir su dimensionalidad. Este proceso consiste en transformar un conjunto de datos que cuenta con muchas variables o características a un nuevo conjunto con menos dimensiones, perdiendo la menor información posible.
+
+En un análisis de scRNASeq, el primer paso de reducción de la dimensionalidad consiste en realizar un análisis de componentes principales (PCA). Por defecto, para realizar este PCA únicamente se utilizarán los genes altamente variables identifiados en el paso anterior, aunque podemos cambiarlos proporcionando un vector con otros genes. La representación del PCA se realiza con un gráfico de dispersión, que podemos generar con una función de Seurat directamente a partir del objeto Seurat con los datos del PCA:
+
+```{r}
+# Análisis PCA
+seu <- Seurat::RunPCA(seu)
+
+# Visualización del PCA
+Seurat::DimPlot(seu, reduction = "pca")
+```
+
+Por defecto, cada punto del PCA (que recordemos representa una célula) se colorea según su grupo de muestra, pero podemos cambiar este comportamiento y colorear según otras variables recogidas en el objeto, como el porcentaje de transcritos de genes mitocondriales.
+
+```{r}
+Seurat::FeaturePlot(seu, reduction = "pca", features = "percent.mito")
+```
+
+::: {.alert .alert-info}
+<strong>Info:</strong> Para colorear según una variable continua, como el % de transcritos de hemoglobina, necesitamos usar `FeaturePlot` en lugar de `DimPlot`.
+:::
+
+De cara al posterior análisis con UMAP, que explicaremos más adelante, podemos generar un gráfico con el método de codo (*elbowplot*) para ayudarnos a determinar cuántos componentes principales utilizar.
+
+```{r}
+Seurat::ElbowPlot(seu, ndims = 40) +
+  ggplot2::geom_vline(xintercept = 25, linetype = "dashed", color = "red", linewidth = 1)
+```
+
+En este tipo de gráficos se ordenan los componentes principales calculados según el porcentaje de varianza explicado por cada uno. Normalmente se observa una curva que al principio desciende bruscamente (porque los primeros PCs explican mucha variación), y luego se va "aplanando". El punto donde la curva empieza a aplanarse (formando el “codo”) indica el punto a partir del cual los siguientes PCs ya no aportan apenas información adicional. En nuestro caso ese punto son \~25 PCs, donde hemos colocado la barra roja vertical punteada.
+
+Una vez identificados los PCs más informativos, podemos aplicar UMAP[^4]. El objetivo es discernir la variedad subyacente de los datos para agrupar las células similares en clústers, independientemente de las muestras de las que proceden.
+
+[^4]: UMAP (*Uniform Manifold Approximation and Projection*) es una técnica de reducción de dimensionalidad que transforma datos complejos en representaciones de 2 o 3 dimensiones, conservando tanto la estructura local como global de los datos. Es muy útil para visualizar agrupaciones (*clusters*) y relaciones entre puntos en conjuntos de datos grandes, como los de scRNAseq. Además, es rápido, escalable y suele preservar mejor la estructura original que otras técnicas como t-SNE.
+
+A la función `RunUMAP` de Seurat le proporcionamos el rango de dimensiones a utilizar (los PCs más informativos identificados en el gráfico anterior) y utilizamos `DimPlot` para visualizarlo:
+
+```{r}
+# Ejecutamos el UMAP
+seu <- Seurat::RunUMAP(seu, dims = 1:25)
+
+# Visualizamos el UMAP con un gráfico de dispersión
+Seurat::DimPlot(seu, reduction = "umap")
+```
+
+En este punto resulta pertinente considerar la integración de los datos. En el análisis de scRNA-seq, integrar conjuntos procedentes de distintos lotes experimentales, donantes o condiciones es un paso habitual para corregir efectos de lote y aumentar la potencia estadística. La necesidad de este proceso se hace evidente cuando un clúster está formado total o mayoritariamente por células de un único grupo muestral. De no aplicar integración, se corre el riesgo de introducir sesgos de interpretación, como etiquetar por separado un mismo tipo celular que aparece dividido en distintos clústers. La idea subyacente es combinar los datos de diferentes muestras para centrarnos en la variabilidad biológica y no en la técnica
+
+En este caso, se observa una distribución relativamente homogénea de células de los 3 grupos muestrales en todos los clusters, por lo que no parece que la integración vaya a contribuir a mejorar su análisis y posterior interpretación.
+
+## 3.1 Número de "vecinos"
+
+En el contexto de la reducción de la dimensionalidad, el número de vecinos es un parámetro que controla el equilibrio entre presevar la estructura local y global de los datos. El algortimo de UMAP costruye un gráfico en el que cada punto está conectado a sus puntos vecinos.
+
+-   Valores bajos (5-15): énfasis en capturar estructuras locales. Visualmente resultará en clusters más pequeños y fragmentados.
+
+-   Valores elevados (50-200): énfasis en la estructura global de los datos. Clusters más grandes.
+
+En general, utilizaremos valores entre 5-50, como recomienda la propia viñeta de Seurat. Podemos tomar el valor por defecto (30).
+
+# 4. Clusterización
+
+La clusterización de scRNA-seq es un paso clave en el análisis para descubrir grupos de células con perfiles de expresión similares, que suelen corresponder a tipos celulares distintos o estados funcionales específicos.
+
+El método de clusterización implementado en Seurat primero construye un gráfico de SNN (*Shared Nearest Neighbor*, literalmente vecino compartido más próximo) basado en la distancia euclidiana en el espacio del PCA. Más adelante se refinan los pesos de los bordes entre dos células cualesquiera basándose en el solapamiento compartido en sus vecindarios locales (similitud de Jaccard). Este paso se realiza mediante la función `FindNeighbors`, y toma como entrada la dimensionalidad del conjunto de datos definida previamente.
+
+```{r}
+seu <- Seurat::FindNeighbors(seu, dims = 1:25, reduction = "pca")
+```
+
+Para clusterizar las células, Seurat luego implementa técnicas de optimización de la modularidad, como el alogoritmo de Louvain (por defecto) o SLM, para agrupar las células de forma iterativa, con el objetivo de optmizar la función de modularidad estándar. La función `FindClusters` implementa este procedimiento, y contiene además un parámetro de resolución que fija la granularidad del clustering, de manera que valores más altos conducen a más clústeres.
+
+```{r}
+seu <- Seurat::FindClusters(seu, resolution = seq(0.1, 1, by=0.1))
+```
+
+Estas operaciones modifican el objeto metadata, añadiéndole nuevas columnas con la identidad de los clústers por resolución. Para visualizar cómo los clusters se subdividen conforme aumentamos la resolución, podemos utilizar la función `clustree` del paquete homónimo.
+
+```{r}
+library(clustree)
+clustree::clustree(
+  seu@meta.data[,grep("RNA_snn_res", colnames(seu@meta.data))],
+  prefix = "RNA_snn_res."
+) +
+  ggraph::scale_edge_colour_gradient(low = "blue", high = "red")
+```
+
+Ahora podemos escoger un nivel de resolución para colorear los clusters en el UMAP. Partiendo del hecho de que no existe una resolución óptima, podríamos seleccionar la 0.2.
+
+Podemos probar para ver si esta resolución se ajusta bien con la distribución del UMAP:
+
+```{r}
+umap_clusters_res_0.2 <- Seurat::DimPlot(seu, group.by = "RNA_snn_res.0.2")
+
+#umap_clusters_res_0.2_condition <- Seurat::DimPlot(seu, group.by = "RNA_snn_res.0.2", split.by = "condition")
+
+umap_clusters_res_0.2
+#umap_clusters_res_0.2_condition
+
+# Guardar imagen en formato de publicación 
+
+ggsave("umap_clusters_res_0.2.png", plot = umap_clusters_res_0.2, 
+       path = "results",
+       dpi = 600, width = 6, height = 4.5, bg = "white")
+
+#ggsave("umap_clusters_res_0.2_condition.png", plot = umap_clusters_res_0.2, 
+#       path = "results",
+ #      dpi = 600, width = 6, height = 4.5, bg = "white")
+
+```
+
+Efectivamente esta parece una buena decisión.
+
+# 5. Asignación y renombrado de identidades de muestra
+
+Tras la clusterización, es útil añadir al objeto Seurat una capa que identifique las muestras por condición (SD o HFD) para facilitar los análisis comparativos.
+
+En este bloque, primero asignamos la identidad activa (`Idents`) de cada célula al grupo de muestra original (`orig.ident`). Luego, renombramos las dos identidades correspondientes a la condición HFD (SAMN29152137 y SAMN29152141) y la identidad correspondiente a SD (SAMN29152142).
+
+Finalmente, guardamos esta información en una nueva columna de los metadatos (`condition`) que utilizaremos en los análisis posteriores.
+
+```{r}
+# Asignar identidad activa a la muestra de origen
+Idents(seu) <- seu$orig.ident
+
+# Renombrar identidades, fusionando subgrupos equivalentes
+seu <- RenameIdents(seu, "SAMN29152137" = "HFD",
+                    "SAMN29152141" = "HFD",
+                    "SAMN29152142" = "SD")
+
+# Guardar identidad en los metadatos para facilitar análisis comparativos
+seu$condition <- Idents(seu)
+
+# Comprobar el número de células por condición
+table(seu$condition)
+```
+
+# 6. Anotación
+
+La anotación consiste en la asignación de identidad (normalmente tipos, linajes o estados celulares) en función de la expresión de ciertos marcadores. Durante este proceso también es posible encontrar nuevos tipos celulares que pudieran haber pasado desapercibidos durante la identificación por otros métodos, como la citometría de flujo.
+
+En el apartado anterior determinamos que la resolución más razonable para el *clustering* era 0.2, por lo que realizaremos la anotación con esta resolución:
+
+```{r}
+seu <- Seurat::SetIdent(seu, value=seu$RNA_snn_res.0.2)
+```
+
+Para la anotación se utilizan los datos de recuentos originales, y NO los integrados. Aunque es cierto que anteriormente determinamos que la integración puede ser interesante para la corrección de efectos de lote, el *clustering* y la visualización, para la anotación puede ser problemática debido al riesgo de sobrecorrección y a la posible pérdida de variación biológica importante para distinguir entre diferentes tipos celulares. Como en este caso no hemos optado por la integración no es necesario modificar nada.
+
+```{r}
+Seurat::DefaultAssay(seu) <- "RNA"
+```
+
+Conviene destacar que la anotación puede hacerse de forma manual o automática:
+
+-   **Manual:** utilizando genes marcadores. Aunque es el más popular, es laborioso y en ocasiones se puede considerar subjetivo e impreciso, ya que depende fundamentalmente de la experiencia del anotador. Esto es consecuencia de que con frecuencia no existen marcadores únicos para un tipo específico de célula, siendo necesarias combinaciones de marcadores o umbrales de expresión para una anotación adecuada Existe una variedad de bases de datos para genes marcadores (PanglaoDB, CellMarker...).
+
+-   **Automático:** se basa bien en perfiles de expresión de transcriptómica *bulk* de tipos de células previamente seleccionados o en guías elaboradas con otros *datasets* de scRNA-seq. En este caso, la anotación puede ser incompleta cuando se estudian células no incluidas en la referencia.
+
+Como los tipos celulares esperados en este experimento están bien caracterizados en publicaciones de referencia, optaremos por la anotación manual.Para realizar la anotación de forma manual, podemos recurrir a dos estrategias principales. Una opción es partir de listas de marcadores para todos los tipos de células que se esperan en los datos y comprobar en qué grupos se expresan. La otra opción es comprobar qué genes están muy expresados en los clústers definidos en el apartado anterior y, a continuación, comprobar si están asociados a tipos celulares conocidos. Conviene destacar que estas aproximaciones son complementarias y pueden combinarse para afinar el proceso de anotación lo máximo posible.
+
+## 6.1 Anotación basada en el SNAT
+
+Vamos a comenzar el proceso de anotación basándonos en el artículo del Scyatic Nerve Atlas (SNAT), una de las principales publicaciones de referencia en el ámbito de estudios de scRNA-seq de tejido nervioso.
+
+### 6.1.1 Listas de genes marcadores
+
+Comenzamos confeccionando las listas de genes marcadores para cada identidad celular descrita en el SNAT.
+
+```{r}
+# Proliferating Schwann Cells (prol. SC)
+prolSC_genes_SNAT <- c("Mki67", "Top2a")
+
+# Immature / Transition Schwann Cells
+iSC_genes_SNAT <- c("Ngfr", "Ncam1", "L1cam")
+
+# Pro-myelinating Schwann Cells
+pmSC_genes_SNAT <- c("Pou3f1", "Cdkn1c")
+
+# Myelinating Schwann Cells (incluye datos Smart-seq2 y 10x Genomics P60)
+mSC_genes_SNAT <- c("Mpz", "Mbp", "Ncmap")
+
+# Remak/Non-myelinating SC (incluye datos Smart-seq2 y 10x Genomics P60)
+remakSC_genes_SNAT <- c("Ngfr", "Ncam1", "L1cam", "Top2a", "Mki67") 
+
+# Immune cells (IC)
+IC_genes_SNAT <- c("Ptprc", "Cd68")
+
+# Endoneurial cells (EnC)
+EnC_genes_SNAT <- c("Pdgfra", "Sox9", "Col2a1", "Cd34")
+
+# Perineurial cells (PnC)
+PnC_genes_SNAT <- c("Pdgfra", "Slc2a1", "Itgb4", "Cd34")
+
+# Epineurial cells (EpC)
+EpC_genes_SNAT <- c("Pdgfra", "Pcolce2", "Ly6c1", "Cd34")
+
+# Endothelial cells 1 (EC1)
+EC1_genes_SNAT <- c("Pecam1", "Cldn5")
+
+# Endothelial cells 2 (EC2)
+EC2_genes_SNAT <- c("Pecam1", "Cd300lg")
+
+# Pericytes/Endothelial cells (Per/EC)
+PerEC_genes_SNAT <- "Pecam1"
+
+# Pericytes/Vascular smooth muscle cells (Per/VSMC)
+PerVSMC_genes_SNAT <- c("Acta2", "Pdgfrb")
+
+```
+
+A continuación, vamos a tratar de determinar en qué clusters se expresan de manera más específica cada uno de estos conjuntos de genes. Para ello, podemos utilizar dotplots y representar directamente la expresión en el UMAP.
+
+### 6.1.2 Anotación de células proliferantes SC (prolSC)
+
+```{r prolSC-dotplot-featureplot}
+dot_plot_prolSC <- SCpubr::do_DotPlot(
+  sample = seu,
+  group.by = "RNA_snn_res.0.2",
+  features = prolSC_genes_SNAT,
+  legend.position = "right",
+  plot.title = "Marcadores de células proliferantes SC"
+)
+dot_plot_prolSC
+
+Seurat::FeaturePlot(seu, prolSC_genes_SNAT, ncol = 2, label = TRUE)
+```
+
+En este caso, no se observa una expresión clara de los marcadores de células proliferantes en ningún clúster, por lo que no anotaremos ninguna célula como prolSC.
+
+### 6.1.3 Anotación de células inmaduras/transition SC (iSC)
+
+```{r iSC-dotplot-featureplot}
+dot_plot_iSC <- SCpubr::do_DotPlot(
+  sample = seu,
+  group.by = "RNA_snn_res.0.2",
+  features = iSC_genes_SNAT,
+  legend.position = "right",
+  plot.title = "Marcadores de células inmaduras/transition SC"
+)
+dot_plot_iSC
+
+Seurat::FeaturePlot(seu, iSC_genes_SNAT, ncol = 2, label = TRUE)
+```
+
+Las huellas de expresión de los marcadores de células inmaduras/transition SC tampoco son claras en ningún clúster, por lo que no anotaremos ninguna célula como iSC.
+
+### 6.1.4 Anotación de células pro-mielinizantes SC (pmSC)
+
+```{r pmSC-dotplot-featureplot}
+dot_plot_pmSC <- SCpubr::do_DotPlot(
+  sample = seu,
+  group.by = "RNA_snn_res.0.2",
+  features = pmSC_genes_SNAT,
+  legend.position = "right",
+  plot.title = "Marcadores de células pro-mielinizantes SC"
+)
+dot_plot_pmSC
+
+Seurat::FeaturePlot(seu, pmSC_genes_SNAT, ncol = 2, label = TRUE)
+```
+
+En este caso sí se observa un patrón de expresión más claro, concretamente en el marcador Pou3f1 en el clúster 4.
+
+### 6.1.5 Anotación de células mielinizantes SC (mSC)
+
+```{r mSC-dotplot-featureplot}
+dot_plot_mSC <- SCpubr::do_DotPlot(
+  sample = seu,
+  group.by = "RNA_snn_res.0.2",
+  features = mSC_genes_SNAT,
+  legend.position = "right",
+  plot.title = "Marcadores de CS mielinizantes",
+  legend.length =  4
+)
+dot_plot_mSC
+
+mSC_featureplot <- Seurat::FeaturePlot(seu, mSC_genes_SNAT, ncol = 2, label = TRUE)
+
+ggsave("mSC_dotplot.png", plot = dot_plot_mSC, 
+       path = "results",
+       dpi = 600, width = 6, height = 4.5, bg = "white")
+
+ggsave("mSC_featureplot.png", plot = mSC_featureplot, 
+       path = "results",
+       dpi = 600, width = 6, height = 4.5, bg = "white")
+
+```
+
+También en este caso se observa un patrón de expresión de los marcadores que permiten identificar células mielinizantes SC, concretamente en los clústers 1 y 4.
+
+### 6.1.6 Anotación de células no mielinizantes SC (nmSC/RemakSC)
+
+```{r nmSC-dotplot-featureplot}
+dot_plot_nmSC <- SCpubr::do_DotPlot(
+  sample = seu,
+  group.by = "RNA_snn_res.0.2",
+  features = remakSC_genes_SNAT,
+  legend.position = "right",
+  plot.title = "Marcadores de células nmSC"
+)
+dot_plot_nmSC
+
+Seurat::FeaturePlot(seu, remakSC_genes_SNAT, ncol = 2, label = TRUE)
+```
+
+Para los marcadores de células de Schwann no mielinizantes, sin embargo, no encontramos ningún patrón concluyente; de hecho apenas observamos expresión en ningún clúster.
+
+### 6.1.7 Anotación de células inmunes (IC)
+
+```{r IC-dotplot-featureplot}
+dot_plot_IC <- SCpubr::do_DotPlot(
+  sample = seu,
+  group.by = "RNA_snn_res.0.2",
+  features = IC_genes_SNAT,
+  legend.position = "right",
+  plot.title = "Marcadores de células inmunes",
+  legend.length = 4
+)
+dot_plot_IC
+
+IC_featureplot <- Seurat::FeaturePlot(seu, IC_genes_SNAT, ncol = 2, label = TRUE)
+
+ggsave("ICC_dotplot.png", plot = dot_plot_IC, 
+       path = "results",
+       dpi = 600, width = 6, height = 4.5, bg = "white")
+
+ggsave("IC_featureplot.png", plot = IC_featureplot, 
+       path = "results",
+       dpi = 600, width = 10, height = 4.5, bg = "white")
+
+```
+
+Los marcadores del SNAT permiten identificar de forma ineqúívoca los clústers 2 y 3 como células inmunes.
+
+### 6.1.8 Anotación de otros tipos celulares
+
+En este punto ya podemos identificar dos grandes grupos celulares en nuestros datos: células de Schwann (clústers 1 y 4) y células inmunes (clústers 2 y 3). Sin embargo, aún queda por identificar el clústers 0. Para ello, vamos a revisar los marcadores de otros tipos celulares descritos en el SNAT.
+
+#### 6.1.8.1 Anotación de células endoneuriales (EnC)
+
+```{r EnC-dotplot-featureplot}
+dot_plot_EnC <- SCpubr::do_DotPlot(
+  sample = seu,
+  group.by = "RNA_snn_res.0.2",
+  features = EnC_genes_SNAT,
+  legend.position = "right",
+  plot.title = "Marcadores de células endoneuriales (EnC)"
+)
+dot_plot_EnC
+
+Seurat::FeaturePlot(seu, EnC_genes_SNAT, ncol = 2, label = TRUE)
+```
+
+No concluyente.
+
+#### 6.1.8.2 Anotación de células perineuriales (PnC)
+
+```{r PnC-dotplot-featureplot}
+dot_plot_PnC <- SCpubr::do_DotPlot(
+  sample = seu,
+  group.by = "RNA_snn_res.0.2",
+  features = PnC_genes_SNAT,
+  legend.position = "right",
+  plot.title = "Marcadores de células perineuriales (PnC)"
+)
+dot_plot_PnC
+
+Seurat::FeaturePlot(seu, PnC_genes_SNAT, ncol = 2, label = TRUE)
+```
+
+No concluyente.
+
+#### 6.1.8.3 Anotación de células epineuriales (EpC)
+
+```{r EpC-dotplot-featureplot}
+dot_plot_EpC <- SCpubr::do_DotPlot(
+  sample = seu,
+  group.by = "RNA_snn_res.0.2",
+  features = EpC_genes_SNAT,
+  legend.position = "right",
+  plot.title = "Marcadores de células epineuriales (EpC)"
+)
+dot_plot_EpC
+
+Seurat::FeaturePlot(seu, EpC_genes_SNAT, ncol = 2, label = TRUE)
+```
+
+No concluyente.
+
+#### 6.1.8.4 Anotación de células endoteliales tipo 1 (EC1)
+
+```{r EC1-dotplot-featureplot}
+dot_plot_EC1 <- SCpubr::do_DotPlot(
+  sample = seu,
+  group.by = "RNA_snn_res.0.2",
+  features = EC1_genes_SNAT,
+  legend.position = "right",
+  plot.title = "Marcadores de células endoteliales tipo 1 (EC1)"
+)
+dot_plot_EC1
+
+Seurat::FeaturePlot(seu, EC1_genes_SNAT, ncol = 2, label = TRUE)
+```
+
+No concluyente.
+
+#### 6.1.8.5 Anotación de células endoteliales tipo 2 (EC2)
+
+```{r EC2-dotplot-featureplot}
+dot_plot_EC2 <- SCpubr::do_DotPlot(
+  sample = seu,
+  group.by = "RNA_snn_res.0.2",
+  features = EC2_genes_SNAT,
+  legend.position = "right",
+  plot.title = "Marcadores de células endoteliales tipo 2 (EC2)"
+)
+dot_plot_EC2
+
+Seurat::FeaturePlot(seu, EC2_genes_SNAT, ncol = 2, label = TRUE)
+```
+
+No concluyente.
+
+#### 6.1.8.6 Anotación de células pericitos/endoteliales (Per/EC)
+
+```{r PerEC-dotplot-featureplot}
+dot_plot_PerEC <- SCpubr::do_DotPlot(
+  sample = seu,
+  group.by = "RNA_snn_res.0.2",
+  features = PerEC_genes_SNAT,
+  legend.position = "right",
+  plot.title = "Marcadores de células pericitos/endoteliales (Per/EC)"
+)
+dot_plot_PerEC
+
+Seurat::FeaturePlot(seu, PerEC_genes_SNAT, ncol = 1, label = TRUE)
+```
+
+No concluyente.
+
+#### 6.1.8.7 Anotación de células pericitos/músculo liso vascular (Per/VSMC)
+
+```{r PerVSMC-dotplot-featureplot}
+dot_plot_PerVSMC <- SCpubr::do_DotPlot(
+  sample = seu,
+  group.by = "RNA_snn_res.0.2",
+  features = PerVSMC_genes_SNAT,
+  legend.position = "right",
+  plot.title = "Marcadores de células pericitos/músculo liso vascular (Per/VSMC)"
+)
+dot_plot_PerVSMC
+
+Seurat::FeaturePlot(seu, PerVSMC_genes_SNAT, ncol = 2, label = TRUE)
+```
+
+No concluyente.
+
+## 6.2 Anotación del cluster 0
+
+Tras revisar los marcadores del SNAT, no hemos conseguido anotar el clúster 0. Por tanto, vamos a recurrir a la estrategia de anotación basada en la identificación de los genes más expresados en este clúster y su posterior búsqueda bibliográfica.
+
+### 6.2.1 Obtención de listas de genes marcadores de cada clúster
+
+Con la función `FindAllMarkers` de Seurat podemos identificar los genes diferencialmente expresados en cada clúster respecto al resto. Además de un filtro por significancia estadística (p-valor ajustado \< 0.05) y maginitud de expresión (log2FC \> 0.58), añadimos la condición de pct.1 \> 0.25 para quedarnos con aquellos genes expresados diferencialmente en al menos un 25% de las células de un clúster respecto al resto.
+
+```{r}
+markers <- FindAllMarkers(
+  seu,
+  logfc.threshold = 0.58,      # solo genes con log2FC > 0.58
+  test.use = "wilcox",         # test de Wilcoxon
+  min.pct = 0.25,              # solo genes expresados en al menos 25% de las células del clúster
+  min.diff.pct = 0.2,          # diferencia de porcentaje de expresión entre grupo y resto > 20%
+  only.pos = T                 # solo genes sobreexpresados en el clúster
+)
+
+markers_filtered <- markers %>% filter(p_val_adj < 0.05, pct.1 >= 0.25)
+```
+
+A continuación, podemos guardar en archivos de texto los 300 genes más expresados en cada clúster para su posterior análisis bibliográfico.
+
+```{r}
+# Bucle para guardar los 300 genes más expresados en cada clúster
+for (i in 0:4) {
+  genes_i <- markers_filtered %>%
+    filter(cluster == i) %>%
+    arrange(desc(avg_log2FC)) %>%
+    slice_head(n = 300) %>%
+    pull(gene)
+  
+  writeLines(genes_i, file.path("results", paste0("cluster_", i, "_top300_genes.txt")))
+}
+```
+
+### 6.2.2 Detalle de anotación del clúster 0
+
+Los anteriores filtros solo arrojaron 3 marcadores lo suficientemente signficativos y uniformemente expresados en el clúster 0: Ftl1, Apoe y Lyz2.
+
+```{r}
+
+# Carga lista de genes marcadores del clúster 0
+cluster0_markers<- readLines("results/cluster_0_top300_genes.txt")
+
+# Representación de los marcadores del clúster 0
+dot_plot_cluster0 <- SCpubr::do_DotPlot(
+  sample = seu,
+  group.by = "RNA_snn_res.0.2",
+  features = cluster0_markers,
+  legend.position = "right",
+  plot.title = "Marcadores del clúster 0",
+  legend.length = 4
+)
+dot_plot_cluster0
+
+cluster0_feature_plot <- Seurat::FeaturePlot(seu, cluster0_markers, ncol = 2, label = TRUE)
+
+ggsave("cluster0_dotplot.png", plot = dot_plot_cluster0, 
+       path = "results",
+       dpi = 600, width = 6, height = 4.5, bg = "white")
+
+ggsave("cluster0_featureplot.png", plot = cluster0_feature_plot, path = "results", dpi = 600, width = 6, height = 4.5, bg = "white")
+
+
+```
+
+Efectivamente podemos ver como estos 3 marcadores se expresan ampliamente en el clúster 0, pero es interesante observar como también aparecen de forma evidente en los clústers 2 y 3, que ya habíamos anotado como células inmunes.
+
+Esto sugiere que el clúster o también podría corresponderse con células inmunes. Esta hipótesis se ve reforzada tras una búsqueda bibliográfica de los 3 genes marcadores con la herramienta EnrichR. En consecuencia, podemos anotar el clúster 0 como células inmunes.
+
+## 6.3 Conclusiones primera anotación
+
+Las anteriores representaciones nos permiten distinguir con la suficiente confianza dos tipos celulares: células de Schwann (clústers 1 y 4) y células inmunes (clusters 0, 2 y 3). Podemos proceder a anotar los clusters en consecuencia:
+
+```{r}
+levels(seu)
+
+seu <- RenameIdents(seu, "0" = "Células inmunes",
+                  "1" = "Células de Schwann",
+                  "2" = "Células inmunes",
+                  "3" = "Células inmunes",
+                  "4" = "Células de Schwann")
+levels(seu)
+table(seu@active.ident)
+seu$first_ann <- Idents(seu)
+table(seu$first_ann)
+
+DimPlot(seu, group.by = "first_ann", reduction = "umap", split.by = "condition")
+
+
+ggsave("umap_first_ann.png", 
+       path = "results",
+       dpi = 600, width = 10, height = 4.5, bg = "white")
+
+```
+
+# 7. Reclusterización de células de Schwann
+
+La anotación descrita en el apartado anterior no ha permitido identificar con claridad subtipos celulares dentro de las células de Schwann. Con el objetivo de afinar el proceso, podemos realizar un filtrado del objeto de Seurat para quedarnos solo con las células de Schwann y volver a clusterizarlas, siguiendo el mismo *pipeline* que en los apartados anteriores.
+
+## 7.1 Filtrado del objeto Seurat
+
+```{r}
+# Filtrar el objeto Seurat para quedarnos solo con los clusters 1 y 4
+
+seu_schwann <- subset(seu, idents = "Células de Schwann")
+```
+
+## 7.3 Repetición del *pipeline* de clusterización
+
+Repetimos los pasos de normalización, escalado, reducción de dimensionalidad y clusterización.
+
+```{r}
+seu_schwann <- Seurat::NormalizeData(seu_schwann,
+                     normalization.method = "LogNormalize",
+                     scale.factor = 10000)
+```
+
+```{r}
+seu_schwann <- Seurat::FindVariableFeatures(seu_schwann,
+                            selection.method = "vst",
+                            nfeatures = 2000)
+```
+
+```{r}
+seu_schwann <- Seurat::ScaleData(seu_schwann)
+```
+
+```{r}
+# Análisis PCA
+seu_schwann <- Seurat::RunPCA(seu_schwann)
+
+# Visualización del PCA
+Seurat::DimPlot(seu_schwann, reduction = "pca", group.by = "condition")
+```
+
+```{r}
+Seurat::ElbowPlot(seu_schwann, ndims = 40) +
+  ggplot2::geom_vline(xintercept = 25, linetype = "dashed", color = "red", linewidth = 1)
+```
+
+Seleccionamos nuevamente 25 PCs como los más explicativos.
+
+```{r}
+# Ejecutamos el UMAP
+seu_schwann <- Seurat::RunUMAP(seu_schwann, dims = 1:25)
+
+# Visualizamos el UMAP con un gráfico de dispersión
+Seurat::DimPlot(seu_schwann, reduction = "umap", group.by = "RNA_snn_res.0.6")
+
+ggsave("umap_schwann.png", plot = Seurat::DimPlot(seu_schwann, reduction = "umap", group.by = "RNA_snn_res.0.6"), 
+       path = "results",
+       dpi = 600, width = 6, height = 4.5, bg = "white")
+
+```
+
+```{r}
+seu_schwann <- Seurat::FindNeighbors(seu_schwann, dims = 1:25, reduction = "pca")
+```
+
+```{r}
+seu_schwann <- Seurat::FindClusters(seu_schwann, resolution = seq(0.1, 1, by=0.1))
+```
+
+```{r}
+library(clustree)
+clustree::clustree(
+  seu_schwann@meta.data[,grep("RNA_snn_res", colnames(seu_schwann@meta.data))],
+  prefix = "RNA_snn_res."
+) +
+  ggraph::scale_edge_colour_gradient(low = "blue", high = "red")
+```
+
+Seleccionamos la primera resolución que permite distinguir nuevos clúster (0.6).
+
+```{r}
+seu_schwann <- Seurat::SetIdent(seu_schwann, value=seu_schwann$RNA_snn_res.0.6)
+
+Seurat::DimPlot(seu_schwann, group.by = "RNA_snn_res.0.6")
+```
+
+## 7.4 Anotación de células de Schwann
+
+Vamos a repetir el proceso de anotación basado en los marcadores del SNAT, pero esta vez en el objeto reclusterizado de células de Schwann.
+
+```{r}
+SCpubr::do_DotPlot(
+  sample = seu_schwann,
+  group.by = "RNA_snn_res.0.6",
+  features = prolSC_genes_SNAT,
+  legend.position = "right",
+  plot.title = "Marcadores de células de Schwann proliferantes"
+)
+
+Seurat::FeaturePlot(seu_schwann, prolSC_genes_SNAT,ncol = 2, label = TRUE)
+```
+
+No logramos identificar células de Schwann proliferantes
+
+```{r}
+SCpubr::do_DotPlot(
+  sample = seu_schwann,
+  group.by = "RNA_snn_res.0.6",
+  features = remakSC_genes_SNAT,,
+  legend.position = "right",
+  plot.title = "Marcadores de células de Schwann no mielinizantes"
+)
+
+Seurat::FeaturePlot(seu_schwann, remakSC_genes_SNAT, ncol = 2, label = TRUE)
+```
+
+Tampoco es posible identificar células de Schwann no mielinizantes.
+
+```{r}
+SCpubr::do_DotPlot(
+  sample = seu_schwann,
+  group.by = "RNA_snn_res.0.6",
+  features = mSC_genes_SNAT,
+  legend.position = "right",
+  plot.title = "Marcadores de células de Schwann mielinizantes"
+)
+
+Seurat::FeaturePlot(seu_schwann, mSC_genes_SNAT, ncol = 2, label = TRUE)
+
+
+ggsave("mSC_schwann_featureplot.png", plot = Seurat::FeaturePlot(seu_schwann, mSC_genes_SNAT, ncol = 2, label = TRUE), 
+       path = "results",
+       dpi = 600, width = 6, height = 4.5, bg = "white")
+```
+
+Lo marcadores de células de Schwann se expresan ampliamente a lo largo de todos los clústers, con especial intensidad en el 0.
+
+```{r}
+SCpubr::do_DotPlot(
+  sample = seu_schwann,
+  group.by = "RNA_snn_res.0.6",
+  features = pmSC_genes_SNAT,
+  legend.position = "right",
+  plot.title = "Marcadores de células de Schwann promielinizantes"
+)
+
+Seurat::FeaturePlot(seu_schwann, pmSC_genes_SNAT, ncol = 2, label = TRUE)
+```
+
+Las células promielinizantes se localizan principalmente en el clúster 1.
+
+```{r}
+SCpubr::do_DotPlot(
+  sample = seu_schwann,
+  group.by = "RNA_snn_res.0.6",
+  features = iSC_genes_SNAT,
+  legend.position = "right",
+  plot.title = "Marcadores de células de Schwann inmaduras"
+)
+
+Seurat::FeaturePlot(seu_schwann, iSC_genes_SNAT, ncol = 2, label = TRUE)
+
+ggsave("iSC_schwann_featureplot.png", plot = Seurat::FeaturePlot(seu_schwann, "Ngfr", label = TRUE), 
+       path = "results",
+       dpi = 600, width = 6, height = 4.5, bg = "white")
+```
+
+No concluyente.
+
+## 7.5 Conclusiones segunda anotación
+
+Tras estos resultados, podemos concluir que la reclusterización no ha permitido identificar con confianza subtipos de células de Schwann adicionales. En consecuencia, para los análisis posteriores, optaremos por mantener la anotación original de células de Schwann y células inmunes.
+
+# 8. Análisis de expresión diferencial
+
+En este apartado evaluaremos las diferencias en la expresión entre los diferentes clústers anteriormente identificados y anotados. Para ello, recurriremos a diferentes funciones, cada una con sus particularidades estadísticas y de diseño, que iremos comentando paso a paso.
+
+## 8.1 Expresión diferencial en células de Schwann entre condiciones
+
+Un aspecto interesante que este diseño experimental nos permite evaluar es si existen diferencias en la expresión génica de las células de Schwann entre las dos condiciones experimentales (HFD vs. SD). Podemos utilizar la función `FindMarkers` de Seurat, que implementa un test de Wilcoxon para identificar genes diferencialmente expresados entre estas condiciones.
+
+```{r}
+DefaultAssay(seu_schwann) <- "RNA"
+
+Idents(seu_schwann) <- "condition"
+
+DEGs <- Seurat::FindMarkers(seu_schwann, ident.1 = "HFD",ident.2 = "SD", group.by = "condition", min.pct = 0.1, logfc.threshold = 0)
+
+DEGs_plot <- SCpubr::do_VolcanoPlot(sample = seu_schwann,
+                               de_genes = DEGs, FC_cutoff = 0.58, pval_cutoff = 0.05, add_gene_tags = T,
+                               order_tags_by = "pvalue",
+                               n_genes =20, use_labels = F, colors.use = "#B44677")
+DEGs_plot
+
+ggsave("VolcanoPlot_DEGs_HFDvsSD.png", DEGs_plot, width = 8.5, height = 7.5, dpi = 600)
+
+# Heatmap de los DEGs
+
+```
+
+Observamos en primer lugar como únicamente un gen (Cmss1) aparece como diferencialmente expresado entre las dos condiciones, concretamente está infraexpresado en HFD vs. SD en las células de Schwann. No obstante, vemos que sí existen tendencias de expresión diferencial en otros genes, aunque no alcanzan la significancia estadística. Esto puede deberse a que el número de células de Schwann en cada condición es relativamente bajo, lo que limita la potencia estadística del test de Wilcoxon. Además, los valores p calculados en este tipo de tests no están ajustados para comparaciones múltiples, lo que puede aumentar la tasa de falsos positivos.
+
+Otra opción es hacer el contraste directamente en el objeto Seurat completo, tal y como recomiendan en el [tutorial](https://satijalab.org/seurat/articles/de_vignette). Para ello, creamos una nueva columna en `meta.data` que combine la información de tipo celular y condición experimental y acto seguido aplicamos `FindMarkers` para comparar las células de Schwann en HFD vs. SD.
+
+```{r}
+# Crear una nueva columna que combine el tipo celular y la condición
+seu$celltype_condition <- paste(seu$first_ann, seu$condition, sep = "_")
+seu$celltype_condition <- factor(seu$celltype_condition)
+levels(seu$celltype_condition)
+```
+
+```{r}
+
+Idents(seu) <- "celltype_condition"
+
+DEGs_SC <- FindMarkers(seu, ident.1 = "Células de Schwann_HFD", ident.2 = "Células de Schwann_SD", verbose = FALSE, min.pct = 0.1, logfc.threshold = 0)
+
+DEGs_SC_plot <- SCpubr::do_VolcanoPlot(sample = seu,
+                               de_genes = DEGs_SC, FC_cutoff = 0.58, pval_cutoff = 0.05, add_gene_tags = T,
+                               order_tags_by = "pvalue",
+                               n_genes =10, use_labels = F, colors.use = "#B44677")
+DEGs_SC_plot
+
+ggsave("results/VolcanoPlot_DEGs_SC_HFDvsSD.png", DEGs_SC_plot, width = 8.5, height = 7.5, dpi = 600)
+```
+
+Vemos como los resultados coinciden con el apartado anterior.
+
+## 8.2 Expresión diferencial en células inmunes entre condiciones
+
+Podemos repetir el mismo análisis para las células inmunes.
+
+```{r}
+Idents(seu) <- "celltype_condition"
+
+DEGs_IC <- FindMarkers(seu, ident.1 = "Células inmunes_HFD", ident.2 = "Células inmunes_SD", verbose = FALSE, min.pct = 0.1, logfc.threshold = 0)
+
+DEGs_IC_plot <- SCpubr::do_VolcanoPlot(sample = seu,
+                               de_genes = DEGs_IC, FC_cutoff = 0.58, pval_cutoff = 0.05, add_gene_tags = T,
+                               order_tags_by = "pvalue",
+                               n_genes =10, use_labels = F, colors.use = "#B44677")
+DEGs_IC_plot
+
+ggsave("results/VolcanoPlot_DEGs_IC_HFDvsSD.png", DEGs_IC_plot, width = 8.5, height = 7.5, dpi = 600)
+
+```
+
+En este caso, ningún gen se observa como diferencialmente expresado, aunque la tendencia con los log2FC se mantiene.
+
+# 9. Comparación con expresión de un estudio de *bulk RNA-seq*
+
+En un estudio previo de este mismo autor se estudió la expresión diferencial entre ratones sometidos a HFD frente a SD en un enfoque de *bulk RNA-seq*. Este contraste había arrojado un total de 122 genes diferencialmente expresados en HFD vs. control. Es interesante observar cómo este patrón de desregulación se reproduce en las poblaciones celulares identificadas con la aproximación de *scRNA-seq*.
+
+## 9.1 Carga de los resultados del estudio de *bulk RNA-seq*
+
+En primer lugar, cargamos estos resultados y repetimos el *volcano plot* generado en el estudio original.
+
+```{r, warning=FALSE, message=FALSE}
+# Carga de los resultados del análisis de expresión diferencial del estudio de bulk RNA-seq
+results_DESEq2_16w_prediabetes <- read.delim("~/Documents/TFM_codigo/TFM_scRNAseq/results_DESEq2_16w_prediabetes.txt")
+
+# Repetición del volcano plot con ggplot2
+
+volcano_plot_16w_prediabetes <- ggplot(data = results_DESEq2_16w_prediabetes, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = case_when(
+    padj >= 0.05 ~ "Non-significant",
+    log2FoldChange > 0.58 ~ "Upregulated",
+    log2FoldChange < -0.58 ~ "Downregulated",
+    TRUE ~ "Non-significant"
+  )), alpha = 0.6) +
+  geom_vline(xintercept = c(-0.58, 0.58), linetype="dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype="dashed", color = "black") +
+  theme_minimal() +
+scale_color_manual(values = c("Downregulated" = "blue", "Upregulated" = "red", "Non-significant" = "gray"), labels = c("Downregulated" = "Regulado a la baja", "Upregulated" = "Regulado al alza", "Non-significant" = "No significativo")) +
+  labs(x = "log2(Fold Change)", y = "-log10(p-value)", title = "HFD vs. Control a 16 semanas", color = "Regulation") +
+  theme(legend.position = c(1, 1), legend.justification = c(1, 0.8), face="bold") +
+  theme(plot.title = element_text(face = "bold")) +
+  guides(color = guide_legend(title = "Regulación"))
+
+
+volcano_plot_16w_prediabetes
+
+# Recuento de genes significativos
+
+significant_genes_16w_prediabetes <- results_DESEq2_16w_prediabetes %>%
+  filter(padj < 0.05 & abs(log2FoldChange) > 0.58)
+
+nrow(significant_genes_16w_prediabetes)
+
+```
+
+Para estudiar el patrón de expresión de los genes diferencialmente expresados en el estudio de *bulk RNA-seq* en el *scRNA-seq*, creamos 3 listas: una con todos los DEGs y otras separando en sobre e infraexpresados.
+
+```{r, warning=FALSE, message=FALSE}
+
+# Creación de listas de DEGs a partir del análisis de bulk RNA-seq
+DEGs_bulk <- results_DESEq2_16w_prediabetes %>%
+  filter(padj < 0.05 & abs(log2FoldChange) > 0.58) %>%
+  pull(symbol)
+
+DEGs_up_bulk <- results_DESEq2_16w_prediabetes %>%
+  filter(padj < 0.05 & log2FoldChange > 0.58) %>%
+  pull(symbol)
+
+DEGs_down_bulk <- results_DESEq2_16w_prediabetes %>%
+  filter(padj < 0.05 & log2FoldChange < -0.58) %>%
+  pull(symbol)
+
+```
+
+## 9.2 Representación gráfica general de los DEGs del *bulk RNA-seq* en el *scRNA-seq*
+
+A partir de estos objetos podemos proceder a realizar varias representaciones gráficas.
+
+Por ejemplo, para evaluar si los DEGs identificados en el bulk se están expresando más en SCs o en ICs generamos el siguiente *heatmap*.
+
+```{r}
+# Ordenar los DEGs del bulk RNA-seq por valor absoluto de log2FC
+DEGs_bulk <- results_DESEq2_16w_prediabetes %>%
+  filter(padj < 0.05 & abs(log2FoldChange) > 0.58) %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  pull(symbol)
+
+# Heatmap de expresión en scRNAseq de los DEGs del bulk
+heatmap_DEGs_bulk <- SCpubr::do_ExpressionHeatmap(
+  sample = seu,
+  features = DEGs_bulk,
+  group.by = "celltype_condition",
+  column_title = "Expresión en scRNAseq de los DEGs identificados en bulk (ordenados por |log2FC|)",
+  cluster_cols = FALSE,
+  cluster_rows = FALSE,
+  cell_size = 8,
+  flip = TRUE,
+  legend.position = "bottom"
+)
+heatmap_DEGs_bulk
+
+png("results/heatmap_all_genes.png", width = 4000, height = 10000, res = 300)
+ComplexHeatmap::draw(heatmap_DEGs_bulk)
+dev.off()
+```
+
+## 9.3 Detalle en las células de Schwann
+
+Con el heatmap del apartado anterior ya podemos ver como, en términos generales, los DEGs del *bulk RNA-seq* se expresan principalmente en las células inmunes. No obstante, podemos profundizar en este análisis generando varios *dotplots* y *heatmaps* para visualizar la expresión de los DEGs del *bulk RNA-seq* en la población de células de Schwann.
+
+Para ello podemos generar *dotplots*, y a partir de estos crear una selección de genes expresados en células de Schwann. Con esta selección, podemos generar *heatmaps* para visualizar su expresión en SC en HFD y SD.
+
+```{r}
+# Dotplot de los DEGs sobreexpresados en HFD en el bulk RNA-seq
+dotplot_up_bulk <- SCpubr::do_DotPlot(
+  sample = seu,
+  group.by = "first_ann",
+  features = DEGs_up_bulk,
+  legend.position = "right",
+  plot.title = "DEGs sobreexpresados en HFD en bulk RNA-seq"
+)
+dotplot_up_bulk
+
+# Dotplot de los DEGs infraexpresados en HFD en el bulk RNA-seq
+dotplot_down_bulk <- SCpubr::do_DotPlot(
+  sample = seu,
+  group.by = "first_ann",
+  features = DEGs_down_bulk,
+  legend.position = "right",
+  plot.title = "DEGs infraexpresados en HFD en bulk RNA-seq"
+)
+dotplot_down_bulk
+
+```
+
+Observando estos gráficos, podemos extraer dos listas de genes diferencialmente expresados en los datos del *bulk* RNA-seq que también se expresan en las células de Schwann de nuestros datos de scRNA-seq. Las dividimos en genes sobreexpresados e infraexpresados en HFD.
+
+```{r}
+# Genes sobreexpresados en HFD en bulk RNA-seq y expresados en células de Schwann en scRNA-seq
+DEGs_up_schwann <- c("Dbp", "Paqr9", "Ctcflos", "Dach1", "Nup210", "Mest", "G0s2", "Zfp874b", "Ctse", "Sell", "Mmp8" )
+
+# Genes infraexpresados en HFD en bulk RNA-seq y expresados en células de Schwann en scRNA-seq
+DEGs_down_schwann <- c("Acot1", "Dusp8", "Crlf1", "Acss2")
+
+```
+
+## 9.4 Evaluación de expresión diferencial en células de Schwann entre condiciones
+
+Ahora, elaboramos unos *heatmaps* para visualizar la expresión de estos genes en las células de Schwann entre las dos condiciones experimentales.
+
+```{r}
+# Heatmap de los DEGs sobreexpresados en HFD en bulk RNA-seq y expresados en células de Schwann en scRNA-seq
+heatmap_up_schwann <- SCpubr::do_ExpressionHeatmap(
+  sample = seu_schwann,
+  features = DEGs_up_schwann,
+  group.by = "condition",
+  column_title = "Genes sobreexpresados en HFD en bulk y en células de Schwann",
+   cluster_cols = FALSE,
+  cluster_rows = TRUE,
+  legend.position = "bottom")
+
+heatmap_up_schwann
+
+FeaturePlot(object = seu_schwann, features = "G0s2", split.by = "condition")
+
+```
+
+Observamos que prácticamente ninguno de los genes sobreexpresados en HFD en el *bulk RNA-seq* muestra también una mayor expresión en las células de Schwann, con la excepción del gen G0s2.
+
+```{r}
+
+# Heatmap de los DEGs infraexpresados en HFD en bulk RNA-seq y expresados en células de Schwann en scRNA-seq
+
+heatmap_down_schwann <- SCpubr::do_ExpressionHeatmap(
+  sample = seu_schwann,
+  features = DEGs_down_schwann,
+  group.by = "condition",
+  column_title = "Genes infraexpresados en HFD en bulk y en células de Schwann",
+  cluster_cols = FALSE,
+  cluster_rows = TRUE,
+  legend.position = "bottom")
+
+heatmap_down_schwann
+
+# Guardamos el heatmap
+
+png("results/heatmap_down_schwann.png", width = 3000, height = 2000, res = 300)
+ComplexHeatmap::draw(heatmap_down_schwann)
+dev.off()
+
+```
+
+Como vemos, apenas unos pocos genes aparecen expresados en el mismo sentido del contraste *bulk* en las células de Schwann.
